@@ -1,0 +1,96 @@
+name: SMAppService spike
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  spike:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: macOS and Swift
+        run: sw_vers; swift --version
+
+      - name: Make a self-signed code signing identity
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cat > cert.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = ext
+          prompt = no
+          [dn]
+          CN = Spike Self-Signed
+          [ext]
+          keyUsage = critical, digitalSignature
+          extendedKeyUsage = critical, codeSigning
+          basicConstraints = critical, CA:false
+          EOF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout key.pem -out cert.pem -config cert.cnf
+          /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem \
+            -out id.p12 -passout pass:spike
+          keychain="$RUNNER_TEMP/spike.keychain-db"
+          security create-keychain -p spike "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p spike "$keychain"
+          security import id.p12 -k "$keychain" -P spike -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k spike "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain cert.pem
+          security find-identity -v -p codesigning
+
+      - name: Build three variants
+        run: |
+          set -euo pipefail
+          for v in adhoc selfsigned selfsigned-untrusted; do
+            ./build.sh "$v" "$RUNNER_TEMP/build"
+          done
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          b="$RUNNER_TEMP/build"
+          sign() { codesign --force --options runtime --timestamp=none --sign "$1" "$2/Contents/MacOS/SpikeAgent" && codesign --force --options runtime --timestamp=none --sign "$1" "$2"; }
+          sign - "$b/Spike-adhoc.app"
+          sign "Spike Self-Signed" "$b/Spike-selfsigned.app"
+          sign "Spike Self-Signed" "$b/Spike-selfsigned-untrusted.app"
+          sudo cp -R "$b"/Spike-*.app /Applications/
+
+      - name: Try ad hoc
+        run: ./try.sh adhoc
+
+      - name: Try self-signed, certificate trusted
+        run: ./try.sh selfsigned
+
+      - name: Remove the certificate's trust, as on a user's Mac
+        run: |
+          sudo security remove-trusted-cert -d "$RUNNER_TEMP/cert.pem"
+          security find-identity -v -p codesigning || true
+
+      - name: Try self-signed, certificate not trusted
+        run: ./try.sh selfsigned-untrusted
+
+      - name: Background task log
+        if: always()
+        run: |
+          log show --last 10m --style compact \
+            --predicate 'subsystem == "com.apple.backgroundtaskmanagement" OR process == "smd" OR eventMessage CONTAINS[c] "spike"' \
+            2>/dev/null | tail -60 || true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.os }}: $(sw_vers -productVersion)"
+            cat "$RUNNER_TEMP"/report-*.md 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"

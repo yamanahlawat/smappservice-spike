@@ -12,6 +12,7 @@ jobs:
       matrix:
         os: [macos-latest, macos-14]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +48,19 @@ jobs:
           security list-keychain -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           sudo security add-trusted-cert -d -r trustRoot -p codeSign \
             -k /Library/Keychains/System.keychain cert.pem
-          security find-identity -v -p codesigning
+          # A second identity that this machine never trusts, as on a user's Mac.
+          # Removing trust later would wait on a password dialog nobody answers.
+          sed 's/Spike Self-Signed/Spike Untrusted/' cert.cnf > untrusted.cnf
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout ukey.pem -out ucert.pem -config untrusted.cnf
+          /usr/bin/openssl pkcs12 -export -inkey ukey.pem -in ucert.pem \
+            -out uid.p12 -passout pass:spike
+          security import uid.p12 -k "$keychain" -P spike -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k spike "$keychain" >/dev/null
+          hash=$(/usr/bin/openssl x509 -in ucert.pem -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)
+          echo "UNTRUSTED_HASH=$hash" >> "$GITHUB_ENV"
+          echo "valid identities:"; security find-identity -v -p codesigning
+          echo "all identities:"; security find-identity -p codesigning
 
       - name: Build three variants
         run: |
@@ -63,7 +76,7 @@ jobs:
           sign() { codesign --force --options runtime --timestamp=none --sign "$1" "$2/Contents/MacOS/SpikeAgent" && codesign --force --options runtime --timestamp=none --sign "$1" "$2"; }
           sign - "$b/Spike-adhoc.app"
           sign "Spike Self-Signed" "$b/Spike-selfsigned.app"
-          sign "Spike Self-Signed" "$b/Spike-selfsigned-untrusted.app"
+          sign "$UNTRUSTED_HASH" "$b/Spike-selfsigned-untrusted.app"
           sudo cp -R "$b"/Spike-*.app /Applications/
 
       - name: Try ad hoc
@@ -71,11 +84,6 @@ jobs:
 
       - name: Try self-signed, certificate trusted
         run: ./try.sh selfsigned
-
-      - name: Remove the certificate's trust, as on a user's Mac
-        run: |
-          sudo security remove-trusted-cert -d "$RUNNER_TEMP/cert.pem"
-          security find-identity -v -p codesigning || true
 
       - name: Try self-signed, certificate not trusted
         run: ./try.sh selfsigned-untrusted
